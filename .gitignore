@@ -1,2 +1,6 @@
 .DS_Store
 .claude/
+
+# 文脈ファイル（非公開）
+docs/
+209-UNIVERSAL-ENTRYPOINT-TEMPLATE.ja.md
