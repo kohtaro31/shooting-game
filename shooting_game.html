@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>スペースシューター</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+    canvas { display: block; }
+    #overlay {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.72);
+    }
+    #overlay h1 { font-size: 52px; color: #0cf; text-shadow: 0 0 30px #0cf; margin-bottom: 10px; letter-spacing: 4px; }
+    #overlay p  { font-size: 16px; color: #aaa; margin: 5px 0; }
+    #overlay .warn { color: #fa0; font-size: 14px; margin-top: 10px; }
+    .start-btn {
+      margin-top: 30px; padding: 14px 44px; font-size: 18px;
+      background: transparent; border: 2px solid #0cf; color: #0cf;
+      cursor: pointer; font-family: inherit; letter-spacing: 3px;
+      text-shadow: 0 0 8px #0cf; box-shadow: 0 0 20px #0cf4; transition: background 0.2s;
+    }
+    .start-btn:hover { background: #0cf2; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">
+  <h1>SPACE SHOOTER</h1>
+  <p>← → / A D キーで移動</p>
+  <p>スペース / Z キーで水鉄砲発射</p>
+  <p>水を使うほど残量（HP）が減る！</p>
+  <p class="warn">💧 水ドロップを拾って補充しよう</p>
+  <button class="start-btn" id="startBtn">START</button>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+// フルスクリーン設定
+canvas.width  = window.innerWidth;
+canvas.height = window.innerHeight;
+const W = canvas.width;
+const H = canvas.height;
+
+const overlay  = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+
+// ---- 定数 ----
+const MAX_WATER       = 100;
+const WATER_PER_SHOT  = 1.8;   // 発射1回あたりの水消費
+const WATER_PER_HIT   = 28;    // 被弾時の水消費
+const DROP_RESTORE    = 20;    // 水ドロップ回収量
+
+// ---- 状態 ----
+let keys = {};
+let score, water, level, gameOver;
+let player, bullets, enemies, enemyBullets, particles, stars, waterDrops;
+let shootCooldown, enemySpawnTimer, bossActive, boss;
+let frame = 0;
+
+// ---- 入力 ----
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+startBtn.addEventListener('click', startGame);
+
+// ---- 初期化 ----
+function startGame() {
+  score = 0; water = MAX_WATER; level = 1; gameOver = false; frame = 0;
+  bullets = []; enemies = []; enemyBullets = []; particles = []; waterDrops = [];
+  shootCooldown = 0; enemySpawnTimer = 0; bossActive = false; boss = null;
+
+  player = { x: W/2, y: H - 120, w: 44, h: 56, speed: 6, invincible: 0 };
+
+  stars = Array.from({length: 160}, () => ({
+    x: Math.random()*W, y: Math.random()*H,
+    speed: 0.4 + Math.random()*2, r: Math.random()*1.6
+  }));
+
+  overlay.style.display = 'none';
+  requestAnimationFrame(loop);
+}
+
+// ---- パーティクル ----
+function spawnParticles(x, y, color, count = 12) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random()*Math.PI*2, s = 1+Math.random()*3.5;
+    particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s, life:1, decay:0.03+Math.random()*0.04, r:2+Math.random()*3, color });
+  }
+}
+
+// ---- 敵スポーン ----
+function spawnEnemy() {
+  const weights = level<3?[0.8,0.2,0]:level<5?[0.5,0.3,0.2]:[0.4,0.3,0.3];
+  const r = Math.random();
+  const type = r<weights[2]?'tank':r<weights[1]+weights[2]?'fast':'basic';
+  const cfg = {
+    basic: { w:38, h:38, hp:1, speed:1.2+level*0.22, color:'#f55', score:100, shootRate:0.005 },
+    fast:  { w:28, h:28, hp:1, speed:2.2+level*0.32, color:'#fa0', score:150, shootRate:0.004 },
+    tank:  { w:48, h:48, hp:3, speed:0.8+level*0.16, color:'#a5f', score:300, shootRate:0.009 },
+  };
+  const c = cfg[type];
+  enemies.push({ x:40+Math.random()*(W-80), y:-c.h, ...c, type, maxHp:c.hp });
+}
+
+// ---- ボス ----
+function spawnBoss() {
+  bossActive = true;
+  boss = { x:W/2, y:110, w:110, h:80, hp:20+level*10, maxHp:20+level*10, speed:2, dir:1, shootTimer:0, color:'#f0f', score:2000+level*500 };
+}
+
+// ---- 更新 ----
+function update() {
+  frame++;
+
+  // 星
+  for (const s of stars) { s.y += s.speed; if (s.y>H) { s.y=0; s.x=Math.random()*W; } }
+
+  // プレイヤー移動
+  if ((keys['ArrowLeft']||keys['KeyA'])  && player.x-player.w/2>0)   player.x -= player.speed;
+  if ((keys['ArrowRight']||keys['KeyD']) && player.x+player.w/2<W)   player.x += player.speed;
+
+  // 発射（水鉄砲）
+  if (shootCooldown>0) shootCooldown--;
+  if ((keys['Space']||keys['KeyZ']) && shootCooldown===0 && water>=WATER_PER_SHOT) {
+    const cd = level>=4 ? 8 : 12;
+    bullets.push({ x:player.x, y:player.y-player.h/2-8, w:5, h:18, speed:14, color:'#4df' });
+    if (level>=3) {
+      bullets.push({ x:player.x-18, y:player.y-player.h/2+2, w:5, h:18, speed:14, color:'#0af' });
+      bullets.push({ x:player.x+18, y:player.y-player.h/2+2, w:5, h:18, speed:14, color:'#0af' });
+      water = Math.max(0, water - WATER_PER_SHOT*1.4);
+    } else {
+      water = Math.max(0, water - WATER_PER_SHOT);
+    }
+    shootCooldown = cd;
+    if (water <= 0) { endGame(); return; }
+  }
+
+  // 弾更新
+  bullets = bullets.filter(b => { b.y -= b.speed; return b.y > -30; });
+
+  // 敵スポーン
+  if (!bossActive) {
+    const interval = Math.max(45, 110-level*9);
+    enemySpawnTimer++;
+    if (enemySpawnTimer >= interval) { spawnEnemy(); enemySpawnTimer=0; }
+    if (score >= level*2000 && enemies.length===0) {
+      level++;
+      if (level%3===0) spawnBoss();
+    }
+  }
+
+  // 敵更新
+  for (let i=enemies.length-1; i>=0; i--) {
+    const e = enemies[i];
+    e.y += e.speed;
+    if (Math.random()<e.shootRate) enemyBullets.push({ x:e.x, y:e.y+e.h/2, speed:3.5+level*0.3 });
+    if (e.y > H+e.h) { enemies.splice(i,1); continue; }
+
+    // 弾命中
+    let hit = false;
+    for (let j=bullets.length-1; j>=0; j--) {
+      const b = bullets[j];
+      if (rectOverlap(b,e)) {
+        e.hp--;
+        bullets.splice(j,1);
+        spawnParticles(b.x, b.y, '#7ef', 4);
+        if (e.hp<=0) {
+          score += e.score;
+          spawnParticles(e.x, e.y, e.color, 18);
+          if (Math.random()<0.3) waterDrops.push({ x:e.x, y:e.y, vy:2, r:10, alpha:1 });
+          enemies.splice(i,1); hit=true; break;
+        }
+      }
+    }
+    if (hit) continue;
+
+    if (player.invincible===0 && rectOverlap(player, e)) {
+      takeDamage(); enemies.splice(i,1);
+    }
+  }
+
+  // ボス更新
+  if (boss) {
+    boss.x += boss.speed*boss.dir;
+    if (boss.x+boss.w/2>W-20||boss.x-boss.w/2<20) boss.dir*=-1;
+    boss.shootTimer++;
+    const rate = Math.max(18, 55-level*2);
+    if (boss.shootTimer>=rate) {
+      boss.shootTimer=0;
+      for (let a=-2;a<=2;a++) enemyBullets.push({ x:boss.x+a*24, y:boss.y+boss.h/2, speed:3+level*0.2 });
+    }
+    for (let j=bullets.length-1; j>=0; j--) {
+      const b = bullets[j];
+      if (rectOverlapBoss(b,boss)) {
+        boss.hp--;
+        bullets.splice(j,1);
+        spawnParticles(b.x, b.y, '#7ef', 4);
+        if (boss.hp<=0) {
+          score += boss.score;
+          spawnParticles(boss.x, boss.y, '#f0f', 32);
+          if (Math.random()<0.7) waterDrops.push({ x:boss.x, y:boss.y, vy:1.5, r:14, alpha:1 });
+          bossActive=false; boss=null; level++; break;
+        }
+      }
+    }
+    if (boss && player.invincible===0 && rectOverlapBoss(player,boss)) takeDamage();
+  }
+
+  // 敵弾更新
+  for (let i=enemyBullets.length-1; i>=0; i--) {
+    const b = enemyBullets[i];
+    b.y += b.speed;
+    if (b.y>H) { enemyBullets.splice(i,1); continue; }
+    if (player.invincible===0 && Math.abs(b.x-player.x)<player.w/2 && Math.abs(b.y-player.y)<player.h/2) {
+      enemyBullets.splice(i,1); takeDamage();
+    }
+  }
+
+  // 水ドロップ更新
+  for (let i=waterDrops.length-1; i>=0; i--) {
+    const d = waterDrops[i];
+    d.y += d.vy;
+    if (d.y > H+20) { waterDrops.splice(i,1); continue; }
+    if (Math.abs(d.x-player.x)<player.w/2+d.r && Math.abs(d.y-player.y)<player.h/2+d.r) {
+      water = Math.min(MAX_WATER, water+DROP_RESTORE);
+      spawnParticles(d.x, d.y, '#4df', 10);
+      waterDrops.splice(i,1);
+    }
+  }
+
+  // パーティクル
+  for (let i=particles.length-1; i>=0; i--) {
+    const p = particles[i];
+    p.x+=p.vx; p.y+=p.vy; p.life-=p.decay;
+    if (p.life<=0) particles.splice(i,1);
+  }
+
+  if (player.invincible>0) player.invincible--;
+}
+
+function takeDamage() {
+  water = Math.max(0, water - WATER_PER_HIT);
+  player.invincible = 100;
+  spawnParticles(player.x, player.y, '#4df', 18);
+  if (water <= 0) endGame();
+}
+
+function endGame() {
+  gameOver = true;
+  overlay.style.display = 'flex';
+  overlay.innerHTML = `
+    <h1>GAME OVER</h1>
+    <p style="font-size:24px;color:#ff0;margin:14px 0">SCORE: ${score}</p>
+    <p>LEVEL: ${level}</p>
+    <p style="color:#4df;margin-top:8px">水が尽きました…</p>
+    <button class="start-btn" id="startBtn">RETRY</button>
+  `;
+  document.getElementById('startBtn').addEventListener('click', startGame);
+}
+
+function rectOverlap(a, b) {
+  return Math.abs(a.x-b.x)<(a.w+b.w)/2 && Math.abs(a.y-b.y)<(a.h+b.h)/2;
+}
+function rectOverlapBoss(a, b) {
+  return Math.abs(a.x-b.x)<(a.w/2+b.w/2) && Math.abs(a.y-b.y)<(a.h/2+b.h/2);
+}
+
+// ---- 描画 ----
+function draw() {
+  ctx.fillStyle = '#050510';
+  ctx.fillRect(0,0,W,H);
+
+  // 星
+  for (const s of stars) {
+    ctx.globalAlpha = 0.4+Math.random()*0.15;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 水ドロップ
+  for (const d of waterDrops) {
+    ctx.save();
+    ctx.shadowBlur = 14; ctx.shadowColor = '#4df';
+    // 雫の形
+    ctx.fillStyle = '#4df';
+    ctx.beginPath();
+    ctx.arc(d.x, d.y+2, d.r*0.75, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(d.x, d.y-d.r);
+    ctx.quadraticCurveTo(d.x+d.r*0.9, d.y+2, d.x, d.y+d.r*0.7);
+    ctx.quadraticCurveTo(d.x-d.r*0.9, d.y+2, d.x, d.y-d.r);
+    ctx.fillStyle = '#8ef';
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+
+  // パーティクル
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // プレイヤー
+  if (player.invincible===0 || Math.floor(player.invincible/6)%2===0) {
+    drawPlayer(player.x, player.y);
+  }
+
+  // 弾（水鉄砲の水）
+  for (const b of bullets) {
+    ctx.shadowBlur = 10; ctx.shadowColor = b.color;
+    ctx.fillStyle = b.color;
+    ctx.beginPath();
+    ctx.ellipse(b.x, b.y, b.w/2, b.h/2, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+
+  // 敵
+  for (const e of enemies) {
+    drawEnemy(e);
+    if (e.maxHp>1) {
+      ctx.fillStyle='#333';
+      ctx.fillRect(e.x-e.w/2, e.y-e.h/2-10, e.w, 5);
+      ctx.fillStyle='#f55';
+      ctx.shadowBlur=4; ctx.shadowColor='#f55';
+      ctx.fillRect(e.x-e.w/2, e.y-e.h/2-10, e.w*(e.hp/e.maxHp), 5);
+      ctx.shadowBlur=0;
+    }
+  }
+
+  // ボス
+  if (boss) {
+    drawBoss(boss);
+    ctx.fillStyle='#333';
+    ctx.fillRect(60, 12, W-120, 10);
+    ctx.fillStyle='#f0f';
+    ctx.shadowBlur=10; ctx.shadowColor='#f0f';
+    ctx.fillRect(60, 12, (W-120)*(boss.hp/boss.maxHp), 10);
+    ctx.shadowBlur=0;
+    ctx.fillStyle='#fff'; ctx.font='bold 11px Courier New'; ctx.textAlign='center';
+    ctx.fillText('BOSS', W/2, 26);
+  }
+
+  // 敵弾
+  ctx.shadowBlur=8; ctx.shadowColor='#f55';
+  ctx.fillStyle='#f88';
+  for (const b of enemyBullets) {
+    ctx.beginPath(); ctx.arc(b.x,b.y,5,0,Math.PI*2); ctx.fill();
+  }
+  ctx.shadowBlur=0;
+
+  // ---- HUD ----
+  drawHUD();
+}
+
+function drawHUD() {
+  const pct = Math.max(0, water/MAX_WATER);
+
+  // スコア（左上）
+  ctx.fillStyle='#0cf'; ctx.shadowBlur=8; ctx.shadowColor='#0cf';
+  ctx.font='bold 20px Courier New'; ctx.textAlign='left';
+  ctx.fillText(`SCORE: ${score}`, 24, 36);
+
+  // レベル（中央上）
+  ctx.fillStyle='#fff'; ctx.shadowBlur=4; ctx.shadowColor='#fff';
+  ctx.font='16px Courier New'; ctx.textAlign='center';
+  ctx.fillText(`LV: ${level}`, W/2, 36);
+  ctx.shadowBlur=0;
+
+  // 水ゲージボトル（右上）
+  const bx = W-80, by = 20;   // ボトル左上基点
+  const bw = 50, bh = 90;     // ボトル本体サイズ
+
+  // ボトルのキャップ
+  ctx.fillStyle = '#2288cc';
+  ctx.shadowBlur = 6; ctx.shadowColor = '#0cf';
+  ctx.beginPath();
+  ctx.roundRect(bx+bw/2-9, by-12, 18, 12, 4);
+  ctx.fill();
+
+  // ネック
+  ctx.fillStyle = '#aaddff';
+  ctx.fillRect(bx+bw/2-8, by-1, 16, 8);
+
+  // ボトル本体アウトライン
+  ctx.strokeStyle = '#4af';
+  ctx.lineWidth = 2;
+  ctx.shadowBlur = 10; ctx.shadowColor = '#0cf';
+  ctx.beginPath();
+  ctx.roundRect(bx, by+7, bw, bh, [4, 4, 10, 10]);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // 水の色（残量に応じて変化）
+  const waterColor = pct > 0.5 ? '#4df' : pct > 0.25 ? '#fa0' : '#f44';
+  const waterH = (bh-4) * pct;
+  const waterY = by+7 + (bh-4) - waterH;
+
+  // クリップして水を描画
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(bx+1, by+8, bw-2, bh-2, [3, 3, 10, 10]);
+  ctx.clip();
+
+  // 水の波アニメーション
+  ctx.fillStyle = waterColor + '99';
+  ctx.fillRect(bx+1, waterY, bw-2, waterH);
+
+  // 水面の波
+  if (pct > 0.02) {
+    const wave = Math.sin(frame*0.12)*3;
+    ctx.fillStyle = waterColor;
+    ctx.beginPath();
+    ctx.moveTo(bx+1, waterY+wave);
+    for (let wx=bx+1; wx<bx+bw-1; wx+=4) {
+      ctx.lineTo(wx, waterY+Math.sin((wx-bx)*0.4+frame*0.12)*3);
+    }
+    ctx.lineTo(bx+bw-1, waterY+wave);
+    ctx.lineTo(bx+bw-1, by+7+bh);
+    ctx.lineTo(bx+1, by+7+bh);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // ボトルの光沢
+  ctx.globalAlpha = 0.25;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(bx+8, by+12, 8, bh-10);
+  ctx.globalAlpha = 1;
+
+  // % 表示
+  ctx.fillStyle = pct>0.25?'#fff':'#f44';
+  ctx.shadowBlur = pct<0.25?10:0; ctx.shadowColor='#f44';
+  ctx.font = 'bold 13px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${Math.ceil(water)}%`, bx+bw/2, by+bh+22);
+
+  ctx.fillStyle = '#888'; ctx.shadowBlur=0;
+  ctx.font = '10px Courier New';
+  ctx.fillText('WATER', bx+bw/2, by+bh+35);
+
+  // 残量少ない警告フラッシュ
+  if (pct < 0.2 && Math.floor(frame/20)%2===0) {
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = '#f44';
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---- プレイヤー描画（ペットボトル） ----
+function drawPlayer(x, y) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.shadowBlur = 12; ctx.shadowColor = '#4af';
+
+  const pct = Math.max(0, water/MAX_WATER);
+  const bw = 28, bh = 46; // ボトル本体
+
+  // キャップ
+  ctx.fillStyle = '#1177bb';
+  ctx.shadowBlur = 6; ctx.shadowColor = '#0cf';
+  ctx.beginPath();
+  ctx.roundRect(-8, -bh/2-14, 16, 14, 4);
+  ctx.fill();
+
+  // ネック
+  ctx.fillStyle = '#aaddff';
+  ctx.fillRect(-7, -bh/2-1, 14, 7);
+
+  // ボトル本体（外枠）
+  ctx.strokeStyle = '#88ccff';
+  ctx.lineWidth = 1.5;
+  ctx.shadowBlur = 8; ctx.shadowColor = '#0af';
+  ctx.beginPath();
+  ctx.roundRect(-bw/2, -bh/2+6, bw, bh, [3,3,8,8]);
+  ctx.stroke();
+
+  // 水の色
+  const wColor = pct>0.5?'#4df':pct>0.25?'#fa0':'#f44';
+  const wH = (bh-4)*pct;
+  const wY = -bh/2+6 + (bh-4) - wH;
+
+  // 水の描画（クリップ）
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(-bw/2+1, -bh/2+7, bw-2, bh-2, [2,2,8,8]);
+  ctx.clip();
+  ctx.fillStyle = wColor+'88';
+  ctx.fillRect(-bw/2+1, wY, bw-2, wH);
+  // 水面の波（小さなボトルなので控えめに）
+  if (pct > 0.05) {
+    const wave = Math.sin(frame*0.15)*1.5;
+    ctx.fillStyle = wColor + 'cc';
+    ctx.beginPath();
+    ctx.moveTo(-bw/2+1, wY+wave);
+    for (let wx=-bw/2+1; wx<bw/2-1; wx+=3) {
+      ctx.lineTo(wx, wY+Math.sin(wx*0.6+frame*0.15)*1.5);
+    }
+    ctx.lineTo(bw/2-1, wY+wave);
+    ctx.lineTo(bw/2-1, -bh/2+6+bh);
+    ctx.lineTo(-bw/2+1, -bh/2+6+bh);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // ラベル（ラベルは常に表示）
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = '#1e5fa0';
+  ctx.fillRect(-bw/2+3, -4, bw-6, 14);
+  ctx.fillStyle = '#fff';
+  ctx.globalAlpha = 1;
+  ctx.font = 'bold 6px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('WATER', 0, 6);
+
+  // 光沢
+  ctx.globalAlpha = 0.2;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(-bw/2+5, -bh/2+10, 5, bh-16);
+  ctx.globalAlpha = 1;
+
+  // 水鉄砲ノズル（左）
+  ctx.shadowBlur = 4; ctx.shadowColor = '#0af';
+  ctx.fillStyle = '#2288cc';
+  ctx.fillRect(-bw/2-10, -bh/2+10, 10, 6);
+
+  // エンジン炎
+  ctx.shadowBlur = 12; ctx.shadowColor = '#fa0';
+  ctx.fillStyle = `hsl(${frame*3%60+20},100%,60%)`;
+  ctx.beginPath();
+  ctx.ellipse(0, bh/2+8, 7, 5+Math.random()*7, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+// ---- 敵描画 ----
+function drawEnemy(e) {
+  ctx.save();
+  ctx.translate(e.x, e.y);
+  ctx.shadowBlur = 12; ctx.shadowColor = e.color;
+
+  if (e.type === 'fast') {
+    ctx.fillStyle = e.color;
+    ctx.beginPath(); ctx.ellipse(0,-4,10,14,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.ellipse(-4,-7,3,4,-0.3,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(4,-7,3,4,0.3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#f00';
+    ctx.beginPath(); ctx.arc(-4,-7,1.2,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(4,-7,1.2,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle=e.color; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(-4,-18); ctx.lineTo(-8,-25); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(4,-18); ctx.lineTo(8,-25); ctx.stroke();
+    ctx.fillStyle=e.color;
+    ctx.beginPath(); ctx.arc(-8,-25,2.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(8,-25,2.5,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle=e.color; ctx.lineWidth=2;
+    for(let i=-1;i<=1;i++){ctx.beginPath();ctx.moveTo(i*6,9);ctx.lineTo(i*11,18);ctx.stroke();}
+
+  } else if (e.type === 'tank') {
+    ctx.fillStyle=e.color;
+    ctx.beginPath(); ctx.ellipse(0,0,21,18,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.ellipse(0,2,14,11,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ffe000';
+    ctx.beginPath(); ctx.arc(-8,-5,5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(8,-5,5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(0,3,3.5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.arc(-8,-5,2.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(8,-5,2.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(0,3,1.8,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle=e.color; ctx.lineWidth=3.5;
+    ctx.beginPath(); ctx.moveTo(-21,0); ctx.lineTo(-30,9); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(21,0); ctx.lineTo(30,9); ctx.stroke();
+
+  } else {
+    ctx.fillStyle=e.color;
+    ctx.beginPath(); ctx.ellipse(0,3,16,9,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=e.color+'99';
+    ctx.beginPath(); ctx.ellipse(0,-3,10,11,0,Math.PI,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#0ff';
+    ctx.beginPath(); ctx.arc(-5,-2,3,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5,-2,3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.arc(-5,-2,1.4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5,-2,1.4,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ff0';
+    for(let i=-2;i<=2;i++){ctx.beginPath();ctx.arc(i*5,9,2,0,Math.PI*2);ctx.fill();}
+  }
+
+  ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+// ---- ボス描画 ----
+function drawBoss(b) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.shadowBlur=24; ctx.shadowColor='#f0f';
+  const pulse = 0.7+Math.sin(frame*0.08)*0.3;
+
+  ctx.fillStyle='#c00eee';
+  ctx.beginPath(); ctx.ellipse(0,4,b.w/2,b.h/2,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(0,8,b.w/2-14,b.h/2-16,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#e040fb';
+  ctx.beginPath(); ctx.ellipse(0,-b.h/2+4,32,26,0,Math.PI,Math.PI*2); ctx.fill();
+  ctx.fillStyle=`rgba(255,220,0,${pulse})`;
+  ctx.beginPath(); ctx.ellipse(-22,-2,14,16,-0.2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(22,-2,14,16,0.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.ellipse(-22,-2,7,9,0,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(22,-2,7,9,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#f00';
+  ctx.beginPath(); ctx.arc(-19,-5,3.5,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(19,-5,3.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=`rgba(0,255,255,${pulse})`;
+  ctx.beginPath(); ctx.arc(0,-b.h/2+12,9,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.arc(0,-b.h/2+12,5,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#f0f'; ctx.lineWidth=3.5;
+  ctx.beginPath(); ctx.moveTo(-16,-b.h/2); ctx.lineTo(-26,-b.h/2-18); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(16,-b.h/2); ctx.lineTo(26,-b.h/2-18); ctx.stroke();
+  ctx.fillStyle=`rgba(255,0,255,${pulse})`;
+  ctx.beginPath(); ctx.arc(-26,-b.h/2-18,6,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(26,-b.h/2-18,6,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#9900bb';
+  ctx.fillRect(-b.w/2-16,10,16,26);
+  ctx.fillRect(b.w/2,10,16,26);
+  ctx.fillStyle='#f0f';
+  ctx.fillRect(-b.w/2-14,32,12,7);
+  ctx.fillRect(b.w/2+2,32,12,7);
+
+  ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+// ---- ループ ----
+function loop() {
+  if (gameOver) return;
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
